@@ -219,6 +219,35 @@ static void test_bad_condition_conf(void) {
 	printf("  config: condition off -> no accounting OK\n");
 }
 
+/* 回归测试：短读后端（mock_short 只填一半）必须 fail-closed，
+ * 绝不能把未填满的缓冲喂给 hash_df（v2 修复锁定）。 */
+static void test_short_read_fail_closed(void) {
+	qrng_core_conf_t cfg;
+	qrng_core_default_conf(&cfg);
+	cfg.health.enabled = 0;
+	cfg.condition.enabled = 1;
+	cfg.drbg.enabled = 0;
+	qrng_core_t *core = qrng_core_new_cfg("mock_short", NULL, &cfg);
+	assert(core != NULL);
+	uint8_t buf[64];
+	assert(qrng_core_generate(core, buf, sizeof buf) < 0);
+	printf("  short-read (conditioning): %s\n", qrng_core_last_error(core));
+	assert(strstr(qrng_core_last_error(core), "short read") != NULL);
+	assert(qrng_core_condition_bytes_out(core) == 0);
+	qrng_core_free(core);
+
+	/* 启动门禁同样：短读 = 故障（测不满声明的 1024 字节） */
+	qrng_core_default_conf(&cfg);
+	cfg.condition.enabled = 0;
+	cfg.drbg.enabled = 0;
+	core = qrng_core_new_cfg("mock_short", NULL, &cfg);
+	assert(core != NULL);
+	assert(qrng_core_generate(core, buf, sizeof buf) < 0);
+	printf("  short-read (startup): %s\n", qrng_core_last_error(core));
+	assert(strstr(qrng_core_last_error(core), "short read") != NULL);
+	qrng_core_free(core);
+}
+
 int main(void) {
 	printf("test_sha256_vectors\n");
 	test_sha256_vectors();
@@ -230,6 +259,8 @@ int main(void) {
 	test_condition_chunking();
 	printf("test_condition_fail_closed\n");
 	test_condition_fail_closed();
+	printf("test_short_read_fail_closed\n");
+	test_short_read_fail_closed();
 	printf("test_bad_condition_conf\n");
 	test_bad_condition_conf();
 	printf("ALL TESTS PASSED\n");

@@ -22,6 +22,7 @@ add_library(qrng_core OBJECT
   src/source/mock_det.c
   src/source/mock_stuck.c
   src/source/mock_biased.c
+  src/source/mock_short.c
   src/source/file.c
 )
 target_include_directories(qrng_core PUBLIC include)

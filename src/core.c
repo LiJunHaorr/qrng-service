@@ -1,6 +1,7 @@
 /* 核心调度层：后端注册 + 健康测试挂载 + fail-closed 状态机。
- * 单线程安全性：generate/bytes_read 持互斥锁（学 rand_qrng.c 的纪律，
- * 服务化之前就把并发的地基打好）。
+ * 并发纪律（学 rand_qrng.c）：generate 持互斥锁串行化；
+ * bytes_read/ready/last_error 是无锁只读快照（64 位对齐读），
+ * 语义上允许读到"刚提交的那次"之前的状态，对记账/监控够用。
  *
  * v1 数据流（健康测试启用时）：
  *   首次 generate 先读 startup_samples 字节做启动测试（90B 4.3：
@@ -179,11 +180,19 @@ static long run_startup(qrng_core_t *core) {
 	}
 	long r = core->backend->read(core->state, buf, need,
 	                             core->error, sizeof core->error);
+	if (r >= 0 && (size_t)r != need) {
+		/* 短读：后端契约允许"返回实际读到的字节数"，但启动门禁
+		 * 必须测满声明的长度——供不上就是故障（fail-closed） */
+		snprintf(core->error, sizeof core->error,
+		         "backend short read during startup test: %ld of %u bytes",
+		         r, need);
+		r = -1;
+	}
 	if (r >= 0) {
 		core->bytes_read += (uint64_t)r;
-		if (!qrng_health_check(core->health, buf, (size_t)r,
-		                       core->error, sizeof core->error)) {
-			r = -1; /* errbuf 已写明哪个测试触发 */
+		if (qrng_health_check(core->health, buf, (size_t)r,
+		                      core->error, sizeof core->error) != 1) {
+			r = -1; /* errbuf 已写明哪个测试触发；!= 1 连误用(-1)也算失败 */
 		}
 	}
 	if (r < 0) {
@@ -221,8 +230,8 @@ static long pull_entropy_locked(qrng_core_t *core, uint8_t *out, size_t n) {
 			if (r >= 0) {
 				core->bytes_read += (uint64_t)r;
 				if (core->health != NULL
-			    && !qrng_health_check(core->health, out, (size_t)r,
-			                   core->error, sizeof core->error)) {
+			    && qrng_health_check(core->health, out, (size_t)r,
+			                   core->error, sizeof core->error) != 1) {
 					core->failed = 1; /* RCT/APT 触发 = 终态，不交付缓冲区 */
 					pthread_mutex_unlock(&core->mutex);
 					return -1;
@@ -258,10 +267,21 @@ static long pull_entropy_locked(qrng_core_t *core, uint8_t *out, size_t n) {
 					free(raw);
 					break;
 				}
+				if ((size_t)got != raw_need) {
+					/* 短读 = 故障：绝不能拿没填满的缓冲去喂 hash_df
+				 * （那等于把未初始化内存当熵），记账也不许虚增 */
+					snprintf(core->error, sizeof core->error,
+					         "backend short read: %ld of %zu bytes "
+					         "(refusing to condition uninitialized memory)",
+					         got, raw_need);
+					core->failed = 1;
+					free(raw);
+					break;
+				}
 				core->bytes_read += (uint64_t)got;
 				if (core->health != NULL
-			    && !qrng_health_check(core->health, raw, (size_t)got,
-				                   core->error, sizeof core->error)) {
+			    && qrng_health_check(core->health, raw, (size_t)got,
+				                   core->error, sizeof core->error) != 1) {
 					core->failed = 1;
 					free(raw);
 					break;
