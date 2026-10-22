@@ -1,0 +1,13 @@
+# 构建产物
+build*/
+# demo 输出
+*.bin
+*.sock
+*.log
+# Python
+__pycache__/
+*.pyc
+# 编辑器/系统
+.vscode/
+.idea/
+.DS_Store
