@@ -1,0 +1,38 @@
+# qrng-service: NIST 90B/90A 分层随机数服务（B 形态：通用随机数服务）
+#
+# 安装（Ubuntu）：
+#   sudo cp deploy/qrng-service.service /etc/systemd/system/
+#   # 按实际路径改 ExecStart 里的二进制与 QUANTIS 设备号
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now qrng-service
+#
+# 故障恢复语义（重要，读一遍再上生产）：
+#   设备掉线/任何链路环节故障 -> 核心 fail-closed -> 服务以非零码退出
+#   -> systemd 按下述策略重启 -> 重启即"复位"：重新读 1024 字节过
+#   启动门禁（90B 4.3 允许由系统复位恢复）。设备没回来时启动失败，
+#   systemd 无限重试（StartLimitIntervalSec=0）；设备回来后自动恢复。
+#   绝不存在"悄悄降级继续供数"。
+
+[Unit]
+Description=QRNG randomness service (NIST SP 800-90B/90A chain, Quantis USB)
+Documentation=https://github.com/iris-pqc/QRNG-DRBG-Demo
+# udev 就绪后再启动（Quantis 规则装在 Drivers/Unix/idq-quantis.rules）
+After=systemd-udevd.service
+
+[Service]
+Type=simple
+User=pqc
+# foreground 交给 systemd 管理；exit-on-failure 触发受监督重启
+ExecStart=/home/pqc/Desktop/qrng-service/build-quantis/qrng-server quantis 0 --foreground --exit-on-failure --socket /run/qrng/qrng.sock --log /home/pqc/qrng-service.log
+# RuntimeDirectory 会创建 /run/qrng 并归属 User
+RuntimeDirectory=qrng
+Restart=on-failure
+RestartSec=5
+# 无限重试：设备可能过很久才回来（换口/换线/换设备）
+StartLimitIntervalSec=0
+# 日志文件之外，journal 也留一份
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

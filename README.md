@@ -54,6 +54,7 @@ qrng-service/
 │   ├── test_service.py       # 服务化集成测试（含 fail-closed 跨进程）
 │   └── test_keygen.py        # keygen 应用集成测试
 ├── tools/stats.py            # 统计检验（卡方 / MCV min-entropy / monobit）
+├── deploy/qrng-service.service  # systemd 单元（受监督重启 + 自动恢复）
 ├── CMakeLists.txt
 ├── README.md
 └── RESULTS.md                # 成果报告：实测数据 / 验收 / 踩坑
@@ -104,6 +105,51 @@ cmake --build ~/quantis-sdk-build -j4 && cmake --install ~/quantis-sdk-build
 `throw(...)` 与 C++17 冲突（固定 C++11）。USB 权限：装
 `Drivers/Unix/idq-quantis.rules` 到 `/etc/udev/rules.d/` 并触发，
 普通用户即可直连。详见 RESULTS.md。
+
+## 生产部署与故障恢复（通用随机数服务形态）
+
+目标形态：常驻服务、多客户端、**扛得住设备掉线等常见故障**。
+
+### 故障恢复闭环（真硬件实测）
+
+```
+设备掉线（实测用 sysfs deauthorize 模拟 USB 失联）
+  → 后端读失败 → 核心 fail-closed → 客户端收到错误
+  → 服务以非零码退出（--exit-on-failure）
+  → systemd 每 5s 无限重试（StartLimitIntervalSec=0）
+  → 设备回来 → 重启即"复位"：重新读 1024B 过启动门禁（90B 4.3
+    明确允许"由系统复位恢复"）→ 自动恢复供数
+```
+
+实测记录（pqcvm03）：设备失联 → 服务 3 次拒绝后退出 → systemd
+NRestarts 持续增长 → 设备恢复 → 服务自动 active → 重新过门禁
+（src=1072 重置）→ 客户端正常取数。**全程零人工干预。**
+
+### 一个必须理解的韧性设计：DRBG 的"设备闪断吸收窗口"
+
+默认 `reseed_interval=1000000` 时，服务启动后 **100 万次请求内不碰设备**
+——设备短暂掉线会被 DRBG 静默吸收（输出仍是计算安全的）。这是特性
+不是缺陷：通用随机数服务要的是可用性。两种策略按需选：
+
+| 策略 | 配置 | 语义 |
+|---|---|---|
+| 高可用（默认） | `--reseed-interval 1000000` | 设备闪断不停服，故障在 reseed 时才暴露 |
+| 严格物理熵 | `--reseed-interval 1` | 每次请求都碰设备，掉线立刻 fail-closed |
+
+### 部署
+
+```bash
+sudo cp deploy/qrng-service.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now qrng-service
+qrng-fetch -s /run/qrng/qrng.sock -n 16      # 验证
+systemctl status qrng-service                 # 看状态/重启计数
+journalctl -u qrng-service -f                 # 跟日志
+```
+
+单元文件里 ExecStart 的二进制路径/设备号按实际改。
+注意 fail-closed 语义：**绝不存在"悄悄降级继续供数"**——
+恢复的唯一路径是进程重启 + 重新过启动门禁。
 
 ## 分层说明
 

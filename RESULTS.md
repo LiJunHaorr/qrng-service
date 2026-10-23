@@ -197,7 +197,20 @@ AES-256 自包含（只需加密方向，CTR/DRBG 永不解密），FIPS 197 + 8
   的物理熵更"硬"）；DRBG 的价值在偶发大吞吐（服务化场景），v3 的
   18.8 倍实测就是这个道理
 
-## 8. 关键实测数字（pqcvm03，Quantis USB）
+## 8. 可靠性实测：设备掉线自动恢复（生产形态 B）
+
+目标重新定位后（通用随机数服务），补齐了故障恢复闭环并实测：
+
+- `--exit-on-failure` + systemd `Restart=on-failure`（`deploy/qrng-service.service`）
+- 实测（sysfs deauthorize 模拟 USB 失联）：掉线 → 客户端收
+  `QuantisReadHandled: Input/output error` → 服务退出 → systemd 每 5s
+  无限重试 → 设备恢复 → 服务自动 active → 重新过 1024B 启动门禁
+  → 恢复供数，全程零人工
+- 韧性设计实测：默认 reseed_interval 下设备掉线被 DRBG 吸收
+  （100 万请求不碰设备）；`--reseed-interval 1` = 严格模式，掉线即拒绝
+- 修复：daemonize 未重定向 stdio（守护进程攥住调用方管道）
+
+## 9. 关键实测数字（pqcvm03，Quantis USB）
 
 | 指标 | 数值 |
 |---|---|

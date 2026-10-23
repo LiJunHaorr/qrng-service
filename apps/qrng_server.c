@@ -13,6 +13,10 @@
  *    到日志文件（--foreground 留前台，测试/调试用）。
  * 3. 默认 Unix domain socket（生产链 QRNG-Provider 的本地形态）；
  *    --tcp PORT 面向远程消费者（对应 OpenSSL provider 场景）。
+ * 4. --exit-on-failure：核心进入终态后服务主动退出（配合 systemd
+ *    Restart=on-failure 实现"设备掉线 -> 拒绝 -> 自动重启 -> 重新走
+ *    启动门禁"的恢复闭环。90B 4.3 允许"由系统/消费应用复位恢复"；
+ *    复位 = 整个进程重来，绝不是悄悄继续供数）。
  */
 #include "proto.h"
 #include "opts.h"
@@ -37,6 +41,8 @@
 #include <unistd.h>
 
 static volatile sig_atomic_t g_stop = 0;
+static volatile sig_atomic_t g_failed = 0; /* --exit-on-failure 触发 */
+static int g_failed_exit = 0;              /* 由 main 从命令行设置 */
 static const char *g_socket_path = NULL;
 
 static void on_signal(int sig) {
@@ -82,6 +88,17 @@ static int daemonize(void) {
 		/* 不致命 */
 	}
 	umask(0077);
+	/* stdio 必须脱离调用方：不重定向的话守护进程攥着 ssh 的管道，
+	 * 调用方会话被挂住（实测踩过）。日志走 FILE*，不受影响。 */
+	int devnull = open("/dev/null", O_RDWR);
+	if (devnull >= 0) {
+		(void)dup2(devnull, STDIN_FILENO);
+		(void)dup2(devnull, STDOUT_FILENO);
+		(void)dup2(devnull, STDERR_FILENO);
+		if (devnull > 2) {
+			close(devnull);
+		}
+	}
 	return 0;
 }
 
@@ -176,6 +193,15 @@ static void serve_client(int fd, qrng_core_t *core, FILE *log,
 			(*failed)++;
 			log_line(log, "FAIL %ld bytes: %s (fail-closed; failures=%llu)",
 			         r, err, *failed);
+			if (g_failed_exit) {
+				/* 终态 + --exit-on-failure：把错误交给本连接后立即退出，
+				 * 由 systemd 重启走恢复闭环（重新过启动门禁） */
+				log_line(log, "exit-on-failure: terminating for supervised restart");
+				g_failed = 1;
+				g_stop = 1;
+				free(buf);
+				return;
+			}
 		}
 		free(buf);
 	}
@@ -185,7 +211,7 @@ static void usage(const char *argv0) {
 	fprintf(stderr,
 	        "usage: %s <backend> [config] [层选项]\n"
 	        "                [--socket PATH] [--tcp PORT] [--foreground]\n"
-	        "                [--log FILE]\n"
+	        "                [--log FILE] [--exit-on-failure]\n"
 	        "层选项同 qrng-cli: --health/--condition/--drbg on|off,\n"
 	        "  --reseed-interval N, --min-entropy H, --alpha-log2 N, --startup N\n",
 	        argv0);
@@ -209,6 +235,7 @@ int main(int argc, char **argv) {
 	const char *log_path = "/tmp/qrng-demo.log";
 	int tcp_port = 0;
 	int foreground = 0;
+	int exit_on_failure = 0;
 
 	for (; argi < argc; argi++) {
 		if (strcmp(argv[argi], "--socket") == 0 && argi + 1 < argc) {
@@ -217,6 +244,8 @@ int main(int argc, char **argv) {
 			tcp_port = (int)strtoul(argv[++argi], NULL, 0);
 		} else if (strcmp(argv[argi], "--foreground") == 0) {
 			foreground = 1;
+		} else if (strcmp(argv[argi], "--exit-on-failure") == 0) {
+			exit_on_failure = 1;
 		} else if (strcmp(argv[argi], "--log") == 0 && argi + 1 < argc) {
 			log_path = argv[++argi];
 		} else {
@@ -318,6 +347,9 @@ int main(int argc, char **argv) {
 	         cfg.health.enabled, cfg.condition.enabled, cfg.drbg.enabled,
 	         cfg.drbg.reseed_interval);
 
+	/* serve_client 读的进程级开关 */
+	g_failed_exit = exit_on_failure;
+
 	unsigned long long served = 0, failed = 0;
 	while (!g_stop) {
 		int client = accept(listen_fd, NULL, NULL);
@@ -339,5 +371,7 @@ int main(int argc, char **argv) {
 	close(listen_fd);
 	fclose(log);
 	qrng_core_free(core);
-	return 0;
+	/* 非零退出码是给 systemd Restart=on-failure 的信号；
+	 * 正常 SIGTERM 停止（systemctl stop）返回 0，不会触发重启 */
+	return g_failed ? 1 : 0;
 }
