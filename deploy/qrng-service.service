@@ -23,7 +23,7 @@ After=systemd-udevd.service
 Type=simple
 User=pqc
 # foreground 交给 systemd 管理；exit-on-failure 触发受监督重启
-ExecStart=/home/pqc/Desktop/qrng-service/build-quantis/qrng-server quantis 0 --foreground --exit-on-failure --socket /run/qrng/qrng.sock --log /home/pqc/qrng-service.log
+ExecStart=/home/pqc/Desktop/qrng-service/build-quantis/qrng-server quantis 0 --foreground --exit-on-failure --monitor-interval 30 --socket /run/qrng/qrng.sock --log /home/pqc/qrng-service.log
 # RuntimeDirectory 会创建 /run/qrng 并归属 User
 RuntimeDirectory=qrng
 Restart=on-failure

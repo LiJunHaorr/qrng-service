@@ -14,6 +14,12 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include <time.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <stdlib.h>
 #include <string.h>
 
@@ -48,13 +54,104 @@ static void test_aes256_vectors(void) {
 	printf("  aes: SP 800-38A F.5.1 CTR block OK\n");
 }
 
+static qrng_drbg_ctx_t *drbg_new_custom(unsigned long long interval,
+                                       unsigned long long bytes,
+                                       unsigned long long seconds) {
+	qrng_drbg_conf_t conf;
+	qrng_drbg_default_conf(&conf);
+	conf.reseed_interval = interval;
+	conf.reseed_bytes = bytes;
+	conf.reseed_seconds = seconds;
+	qrng_drbg_ctx_t *ctx = qrng_drbg_new(&conf);
+	assert(ctx != NULL);
+	return ctx;
+}
+
+/* v5 可靠性：双阈值 reseed（字节总量 + 时间） */
+static void test_dual_threshold_reseed(void) {
+	/* 字节阈值 32：两个 16B 请求后第三个触发 reseed required */
+	qrng_drbg_ctx_t *drbg = drbg_new_custom(1000000, 32, 0);
+	uint8_t seed[48], buf[16];
+	memset(seed, 0xAB, sizeof seed);
+	assert(qrng_drbg_instantiate(drbg, seed) == 1);
+	assert(qrng_drbg_generate(drbg, buf, sizeof buf) == 1);
+	assert(!qrng_drbg_needs_reseed(drbg));
+	assert(qrng_drbg_generate(drbg, buf, sizeof buf) == 1);
+	assert(qrng_drbg_needs_reseed(drbg));   /* 32B >= 32B 阈值 */
+	assert(qrng_drbg_generate(drbg, buf, sizeof buf) == 0); /* 拒绝 */
+	assert(qrng_drbg_reseed(drbg, seed) == 1);
+	assert(!qrng_drbg_needs_reseed(drbg));  /* 记账归零 */
+	printf("  reseed-bytes: 32B threshold triggers and resets OK\n");
+	qrng_drbg_free(drbg);
+
+	/* 时间阈值 1 秒：睡 1 秒后触发 */
+	drbg = drbg_new_custom(1000000, 0, 1);
+	assert(qrng_drbg_instantiate(drbg, seed) == 1);
+	assert(!qrng_drbg_needs_reseed(drbg));  /* 刚实例化，未超时 */
+
+#ifdef _WIN32
+	Sleep(1100); /* WinAPI，ms */
+#else
+	sleep(1);
+#endif
+	assert(qrng_drbg_needs_reseed(drbg));   /* 惰性触发：下次请求检查 */
+	printf("  reseed-seconds: 1s time threshold OK\n");
+	qrng_drbg_free(drbg);
+
+	/* 核心层：字节阈值触发时自动从源拉新种子（记账可核对） */
+	qrng_core_conf_t cfg;
+	qrng_core_default_conf(&cfg);
+	cfg.health.enabled = 0;
+	cfg.condition.enabled = 0;
+	cfg.drbg.enabled = 1;
+	cfg.drbg.reseed_interval = 1000000;
+	cfg.drbg.reseed_bytes = 32;   /* 两个 16B 请求就 reseed */
+	cfg.drbg.reseed_seconds = 0;
+	qrng_core_t *core = qrng_core_new_cfg("mock_det", "0", &cfg);
+	assert(core != NULL);
+	assert(qrng_core_generate(core, buf, sizeof buf) == 16); /* 种子 48 */
+	assert(qrng_core_generate(core, buf, sizeof buf) == 16);
+	assert(qrng_core_generate(core, buf, sizeof buf) == 16); /* 触发 reseed */
+	assert(qrng_core_drbg_reseeds(core) == 1);
+	assert(qrng_core_bytes_read(core) == 48 + 48); /* 种子 + reseed 种子 */
+	printf("  core: byte threshold pulls new seed (96B from source) OK\n");
+	qrng_core_free(core);
+}
+
+static void test_core_monitor(void) {
+	/* 监控心跳：过健康测试后丢弃、计入 bytes_read、不进条件化记账 */
+	qrng_core_conf_t cfg;
+	qrng_core_default_conf(&cfg);   /* 健康开 */
+	cfg.condition.enabled = 1;
+	cfg.drbg.enabled = 0;
+	qrng_core_t *core = qrng_core_new_cfg("mock_det", "0", &cfg);
+	assert(core != NULL);
+	assert(qrng_core_monitor(core, 1024) == 1);
+	assert(qrng_core_bytes_read(core) == 1024);          /* 记账诚实 */
+	assert(qrng_core_condition_bytes_in(core) == 0);     /* 未条件化 */
+	uint64_t tested = qrng_health_samples_tested(qrng_core_health(core));
+	assert(tested == 1024);
+	printf("  monitor: 1024B tested+discarded, accounting honest OK\n");
+
+	/* 源坏：监控发现即终态（与供数同判） */
+	qrng_core_t *bad = qrng_core_new("mock_stuck", NULL);
+	assert(bad != NULL);
+	assert(qrng_core_monitor(bad, 64) == 0);
+	const char *err = qrng_core_last_error(bad);
+	printf("  monitor: stuck source detected: %s\n", err);
+	assert(strstr(err, "RCT") != NULL);
+	assert(qrng_core_generate(bad, (uint8_t[8]){0}, 8) < 0);
+	qrng_core_free(core);
+	qrng_core_free(bad);
+}
+
 static void test_ctr_drbg_structure(void) {
 	uint8_t seed[QRNG_CTR_DRBG_SEEDLEN];
 	for (size_t i = 0; i < sizeof seed; i++) {
 		seed[i] = (uint8_t)(i * 7 + 1);
 	}
 
-	qrng_drbg_ctx_t *drbg = qrng_drbg_new(1000);
+	qrng_drbg_ctx_t *drbg = drbg_new_custom(1000, 0, 0);
 	assert(drbg != NULL);
 	assert(qrng_drbg_generate(drbg, seed, 0) == 0); /* 未实例化先拒绝 */
 	assert(qrng_drbg_instantiate(drbg, seed) == 1);
@@ -98,7 +195,7 @@ static void test_ctr_drbg_structure(void) {
 
 	/* 确定性：同种子两个实例，走完相同请求序列后流一致
 	 * （drbg 之前已消费一个 16 字节请求，drbg2 先同步消费一个） */
-	qrng_drbg_ctx_t *drbg2 = qrng_drbg_new(1000);
+	qrng_drbg_ctx_t *drbg2 = drbg_new_custom(1000, 0, 0);
 	assert(qrng_drbg_instantiate(drbg2, seed) == 1);
 	uint8_t stream1[64], stream2[64], sync[16];
 	assert(qrng_drbg_generate(drbg2, sync, sizeof sync) == 1);
@@ -113,7 +210,7 @@ static void test_ctr_drbg_structure(void) {
 	uint8_t seed2[48];
 	memcpy(seed2, seed, sizeof seed2);
 	seed2[0] ^= 1;
-	qrng_drbg_ctx_t *drbg3 = qrng_drbg_new(1000);
+	qrng_drbg_ctx_t *drbg3 = drbg_new_custom(1000, 0, 0);
 	assert(qrng_drbg_instantiate(drbg3, seed2) == 1);
 	uint8_t stream3[64];
 	assert(qrng_drbg_generate(drbg3, stream3, sizeof stream3) == 1);
@@ -127,7 +224,7 @@ static void test_ctr_drbg_structure(void) {
 static void test_ctr_drbg_reseed_semantics(void) {
 	uint8_t seed[48];
 	memset(seed, 0xAB, sizeof seed);
-	qrng_drbg_ctx_t *drbg = qrng_drbg_new(2); /* 每 2 个请求 reseed */
+	qrng_drbg_ctx_t *drbg = drbg_new_custom(2, 0, 0); /* 每 2 个请求 reseed */
 	assert(qrng_drbg_instantiate(drbg, seed) == 1);
 	uint8_t buf[16];
 	/* 90A 10.2.1.5.1 步骤 1：generate 前检查 reseed_counter > interval。
@@ -147,7 +244,7 @@ static void test_ctr_drbg_reseed_semantics(void) {
 	printf("  drbg: reseed_required at interval boundary OK\n");
 	qrng_drbg_free(drbg);
 
-	assert(qrng_drbg_new(0) == NULL); /* interval 必须 >= 1 */
+	assert(qrng_drbg_new(NULL) == NULL); /* interval 必须 >= 1 */
 }
 
 static void test_core_drbg_integration(void) {
@@ -241,6 +338,10 @@ int main(void) {
 	test_core_drbg_integration();
 	printf("test_core_reseed_interval\n");
 	test_core_reseed_interval();
+	printf("test_dual_threshold_reseed\n");
+	test_dual_threshold_reseed();
+	printf("test_core_monitor\n");
+	test_core_monitor();
 	printf("test_core_drbg_fail_closed\n");
 	test_core_drbg_fail_closed();
 	printf("ALL TESTS PASSED\n");

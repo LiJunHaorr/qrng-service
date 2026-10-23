@@ -26,16 +26,24 @@
 #define QRNG_CTR_DRBG_SEEDLEN 48 /* 256 bit Key + 128 bit V */
 
 typedef struct {
-	int enabled;                   /* 0 = 输出条件化字节（v2 行为） */
-	unsigned long long reseed_interval; /* 两次 reseed 间的最大请求数，
-	                                     * 默认 1000000（规范上限 2^48） */
+	int enabled;                        /* 0 = 输出条件化字节（v2 行为） */
+	unsigned long long reseed_interval; /* 请求数阈值，默认 1000000
+	                                     * （规范上限 2^48） */
+	unsigned long long reseed_bytes;    /* 字节总量阈值，默认 1 GiB。
+	                                     * 防大请求失衡：单种子摊的输出
+	                                     * 量也必须有上限。0 = 不限 */
+	unsigned long long reseed_seconds;  /* 时间阈值，默认 86400（24h）。
+	                                     * 防安静服务失衡：低流量时
+	                                     * 同一状态也不许用太久。
+	                                     * 0 = 不限。惰性触发：下次
+	                                     * 请求时检查并 reseed */
 } qrng_drbg_conf_t;
 
 void qrng_drbg_default_conf(qrng_drbg_conf_t *conf);
 
 typedef struct qrng_drbg_ctx qrng_drbg_ctx_t;
 
-qrng_drbg_ctx_t *qrng_drbg_new(unsigned long long reseed_interval);
+qrng_drbg_ctx_t *qrng_drbg_new(const qrng_drbg_conf_t *conf);
 
 /* 用 seedlen=48 字节的满熵种子实例化（10.2.1.3.1）：
  * Key=0, V=0 起步，Update(seed)，reseed_counter=1。

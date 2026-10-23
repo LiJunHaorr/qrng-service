@@ -24,6 +24,7 @@
 #include "qrng/qrng_core.h"
 
 #include <arpa/inet.h>
+#include <poll.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -43,6 +44,49 @@
 static volatile sig_atomic_t g_stop = 0;
 static volatile sig_atomic_t g_failed = 0; /* --exit-on-failure 触发 */
 static int g_failed_exit = 0;              /* 由 main 从命令行设置 */
+static unsigned g_monitor_interval = 60;   /* 监控心跳间隔（秒），0 = 关 */
+static size_t g_monitor_bytes = 1024;      /* 每次心跳拉的源字节数 */
+static time_t g_next_tick = 0;             /* 下次心跳时刻 */
+static unsigned long long g_monitor_ticks = 0;
+static unsigned long long g_monitor_fails = 0;
+
+static void log_line(FILE *log, const char *fmt, ...); /* 前置声明 */
+
+/* 距下次心跳的毫秒数；监控关闭返回 -1（无限阻塞） */
+static int ms_until_next_tick(void) {
+	if (g_monitor_interval == 0) {
+		return -1;
+	}
+	time_t now = time(NULL);
+	long remaining = (long)(g_next_tick - now);
+	if (remaining < 0) {
+		remaining = 0;
+	}
+	return (int)(remaining * 1000L);
+}
+
+/* 执行一次监控心跳。返回 0 = 源故障（核心已进终态）。 */
+static int run_monitor_tick(qrng_core_t *core, FILE *log) {
+	g_next_tick = time(NULL) + g_monitor_interval;
+	g_monitor_ticks++;
+	int ok = qrng_core_monitor(core, g_monitor_bytes);
+	if (ok) {
+		if (g_monitor_ticks == 1) {
+			log_line(log, "monitor: first tick OK (%zuB, interval=%us)",
+			         g_monitor_bytes, g_monitor_interval);
+		}
+	} else {
+		g_monitor_fails++;
+		log_line(log, "monitor: SOURCE FAILURE at tick %llu: %s",
+		         g_monitor_ticks, qrng_core_last_error(core));
+		if (g_failed_exit) {
+			log_line(log, "exit-on-failure: terminating for supervised restart");
+			g_failed = 1;
+			g_stop = 1;
+		}
+	}
+	return ok;
+}
 static const char *g_socket_path = NULL;
 
 static void on_signal(int sig) {
@@ -145,6 +189,32 @@ static void put_le32(uint8_t *b, uint32_t v) {
 static void serve_client(int fd, qrng_core_t *core, FILE *log,
                          unsigned long long *served, unsigned long long *failed) {
 	for (;;) {
+		/* 心跳兼容长连接：等请求可读 or 到心跳时刻 */
+		struct pollfd pfd = {fd, POLLIN, 0};
+		int pr = poll(&pfd, 1, ms_until_next_tick());
+		if (pr == 0) {
+			/* 超时 = 心跳到点。源坏且要求退出时，给本连接一个
+			 * 明确错误再断开（其余客户端由主循环善后） */
+			if (g_monitor_interval != 0 && !run_monitor_tick(core, log)
+			    && g_stop) {
+				const char *err = qrng_core_last_error(core);
+				uint8_t hdr[5] = {QRNG_PROTO_STATUS_FAIL, 0, 0, 0, 0};
+				put_le32(hdr + 1, (uint32_t)strlen(err));
+				(void)write_full(fd, hdr, sizeof hdr);
+				(void)write_full(fd, err, strlen(err));
+				return;
+			}
+			continue;
+		}
+		if (pr < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			return;
+		}
+		if (!(pfd.revents & (POLLIN | POLLHUP | POLLERR))) {
+			continue;
+		}
 		uint8_t req[4];
 		if (read_full(fd, req, sizeof req) < 0) {
 			return; /* 客户端关闭/断开：正常结束 */
@@ -212,6 +282,7 @@ static void usage(const char *argv0) {
 	        "usage: %s <backend> [config] [层选项]\n"
 	        "                [--socket PATH] [--tcp PORT] [--foreground]\n"
 	        "                [--log FILE] [--exit-on-failure]\n"
+	        "                [--monitor-interval SEC] [--monitor-bytes N]\n"
 	        "层选项同 qrng-cli: --health/--condition/--drbg on|off,\n"
 	        "  --reseed-interval N, --min-entropy H, --alpha-log2 N, --startup N\n",
 	        argv0);
@@ -246,6 +317,15 @@ int main(int argc, char **argv) {
 			foreground = 1;
 		} else if (strcmp(argv[argi], "--exit-on-failure") == 0) {
 			exit_on_failure = 1;
+		} else if (strcmp(argv[argi], "--monitor-interval") == 0 && argi + 1 < argc) {
+			g_monitor_interval = (unsigned)strtoul(argv[++argi], NULL, 0);
+		} else if (strcmp(argv[argi], "--monitor-bytes") == 0 && argi + 1 < argc) {
+			g_monitor_bytes = (size_t)strtoul(argv[++argi], NULL, 0);
+			if (g_monitor_bytes == 0 || g_monitor_bytes > QRNG_PROTO_MAX_REQUEST) {
+				fprintf(stderr, "--monitor-bytes must be in [1, %u]\n",
+				         QRNG_PROTO_MAX_REQUEST);
+				return 1;
+			}
 		} else if (strcmp(argv[argi], "--log") == 0 && argi + 1 < argc) {
 			log_path = argv[++argi];
 		} else {
@@ -343,28 +423,57 @@ int main(int argc, char **argv) {
 	log_line(log, "qrng-server started: backend=%s%s%s tcp=%d foreground=%d",
 	         backend, config ? " config=" : "", config ? config : "",
 	         tcp_port, foreground);
-	log_line(log, "chain: health=%d condition=%d drbg=%d (reseed_interval=%llu)",
+	log_line(log, "chain: health=%d condition=%d drbg=%d "
+	         "(reseed: %llu req / %llu B / %llu s)",
 	         cfg.health.enabled, cfg.condition.enabled, cfg.drbg.enabled,
-	         cfg.drbg.reseed_interval);
+	         cfg.drbg.reseed_interval, cfg.drbg.reseed_bytes,
+	         cfg.drbg.reseed_seconds);
+	if (g_monitor_interval != 0) {
+		log_line(log, "monitor: heartbeat ON (%zuB every %us)",
+		         g_monitor_bytes, g_monitor_interval);
+	} else {
+		log_line(log, "monitor: heartbeat OFF (time blind spot: source only "
+		         "checked at startup/seed pulls)");
+	}
 
 	/* serve_client 读的进程级开关 */
 	g_failed_exit = exit_on_failure;
+	if (g_monitor_interval != 0) {
+		g_next_tick = time(NULL) + g_monitor_interval;
+	}
 
 	unsigned long long served = 0, failed = 0;
 	while (!g_stop) {
-		int client = accept(listen_fd, NULL, NULL);
-		if (client < 0) {
+		/* 等新连接 or 心跳到点（poll 超时驱动，无需独立线程） */
+		struct pollfd pfd = {listen_fd, POLLIN, 0};
+		int pr = poll(&pfd, 1, ms_until_next_tick());
+		if (pr < 0) {
 			if (errno == EINTR) {
 				continue;
 			}
-			log_line(log, "accept: %s", strerror(errno));
+			log_line(log, "poll: %s", strerror(errno));
 			break;
 		}
-		serve_client(client, core, log, &served, &failed);
-		close(client);
+		if (g_monitor_interval != 0 && time(NULL) >= g_next_tick) {
+			run_monitor_tick(core, log);
+		}
+		if (pr > 0 && (pfd.revents & POLLIN)) {
+			int client = accept(listen_fd, NULL, NULL);
+			if (client < 0) {
+				if (errno == EINTR) {
+					continue;
+				}
+				log_line(log, "accept: %s", strerror(errno));
+				break;
+			}
+			serve_client(client, core, log, &served, &failed);
+			close(client);
+		}
 	}
 
-	log_line(log, "qrng-server stopping: served=%llu failed=%llu", served, failed);
+	log_line(log, "qrng-server stopping: served=%llu failed=%llu "
+	         "monitor_ticks=%llu monitor_fails=%llu",
+	         served, failed, g_monitor_ticks, g_monitor_fails);
 	if (g_socket_path != NULL) {
 		unlink(g_socket_path);
 	}

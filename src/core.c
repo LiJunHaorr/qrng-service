@@ -126,7 +126,7 @@ static qrng_core_t *core_new_common(const char *backend, const char *config,
 		core->condition_min_entropy = cconf->min_entropy_bits;
 	}
 	if (dconf != NULL && dconf->enabled) {
-		core->drbg = qrng_drbg_new(dconf->reseed_interval);
+		core->drbg = qrng_drbg_new(dconf);
 		if (core->drbg == NULL) {
 			snprintf(g_init_error, sizeof g_init_error,
 			         "drbg init failed (reseed_interval must be >= 1)");
@@ -370,6 +370,53 @@ done:;
 
 uint64_t qrng_core_bytes_read(const qrng_core_t *core) {
 	return core ? core->bytes_read : 0;
+}
+
+int qrng_core_monitor(qrng_core_t *core, size_t n) {
+	if (core == NULL || n == 0) {
+		return 0;
+	}
+	pthread_mutex_lock(&core->mutex);
+	int ok = 1;
+	if (core->failed) {
+		ok = 0; /* 终态：监控确认故障仍在（错误保持第一次的） */
+	} else if (core->health == NULL) {
+		ok = 1; /* 健康测试未启用 = 无监控对象 */
+	} else {
+		uint8_t *buf = malloc(n);
+		if (buf == NULL) {
+			snprintf(core->error, sizeof core->error,
+			         "out of memory (monitoring buffer %zu bytes)", n);
+			core->failed = 1;
+			ok = 0;
+		} else {
+			long r = core->backend->read(core->state, buf, n,
+			                             core->error, sizeof core->error);
+			if (r < 0) {
+				/* 读失败：后端已把原因写进 core->error（如设备 I/O 错误），
+				 * 保留原始信息，不用泛化消息覆盖 */
+				core->failed = 1;
+				ok = 0;
+			} else if ((size_t)r != n) {
+				/* 短读 = 故障（与供数路径同一纪律） */
+				snprintf(core->error, sizeof core->error,
+				         "monitor: backend short read: %ld of %zu bytes",
+				         r, n);
+				core->failed = 1;
+				ok = 0;
+			} else {
+				core->bytes_read += (uint64_t)r;
+				if (qrng_health_check(core->health, buf, (size_t)r,
+				                core->error, sizeof core->error) != 1) {
+					core->failed = 1; /* 源真坏：与供数同判，终态 */
+					ok = 0;
+				}
+			}
+			free(buf);
+		}
+	}
+	pthread_mutex_unlock(&core->mutex);
+	return ok;
 }
 
 uint64_t qrng_core_drbg_bytes_generated(const qrng_core_t *core) {

@@ -5,6 +5,7 @@
 #include "qrng/qrng_aes.h"
 
 #include <stdlib.h>
+#include <time.h>
 #include <string.h>
 
 /* 90A 9.3 的单请求上限是 2^19 bit；demo 取 4096 字节（2^15 bit）
@@ -17,6 +18,8 @@ void qrng_drbg_default_conf(qrng_drbg_conf_t *conf) {
 	}
 	conf->enabled = 1;
 	conf->reseed_interval = 1000000;
+	conf->reseed_bytes = 1073741824ULL; /* 1 GiB */
+	conf->reseed_seconds = 86400;       /* 24 h */
 }
 
 struct qrng_drbg_ctx {
@@ -25,18 +28,25 @@ struct qrng_drbg_ctx {
 	uint8_t V[QRNG_AES_BLOCK_BYTES];
 	unsigned long long reseed_interval;
 	unsigned long long reseed_counter;
+	/* 双阈值 reseed（v5 可靠性） */
+	uint64_t bytes_since_seed;  /* 本次种子以来产出的字节数 */
+	uint64_t byte_limit;        /* 字节总量阈值，0 = 不限 */
+	uint64_t time_limit;        /* 时间阈值（秒），0 = 不限 */
+	time_t last_seed_time;      /* 上次 instantiate/reseed 时刻 */
 	int instantiated;
 };
 
-qrng_drbg_ctx_t *qrng_drbg_new(unsigned long long reseed_interval) {
-	if (reseed_interval < 1) {
+qrng_drbg_ctx_t *qrng_drbg_new(const qrng_drbg_conf_t *conf) {
+	if (conf == NULL || conf->reseed_interval < 1) {
 		return NULL;
 	}
 	qrng_drbg_ctx_t *ctx = calloc(1, sizeof *ctx);
 	if (ctx == NULL) {
 		return NULL;
 	}
-	ctx->reseed_interval = reseed_interval;
+	ctx->reseed_interval = conf->reseed_interval;
+	ctx->byte_limit = conf->reseed_bytes;
+	ctx->time_limit = conf->reseed_seconds;
 	return ctx;
 }
 
@@ -89,6 +99,8 @@ int qrng_drbg_instantiate(qrng_drbg_ctx_t *ctx, const uint8_t seed[QRNG_CTR_DRBG
 	memcpy(ctx->V, zero_v, QRNG_AES_BLOCK_BYTES);
 	ctr_drbg_update(ctx, seed);
 	ctx->reseed_counter = 1;
+	ctx->bytes_since_seed = 0;
+	ctx->last_seed_time = time(NULL);
 	ctx->instantiated = 1;
 	return 1;
 }
@@ -101,6 +113,8 @@ int qrng_drbg_reseed(qrng_drbg_ctx_t *ctx, const uint8_t seed[QRNG_CTR_DRBG_SEED
 	 * Update(seed_material); reseed_counter = 1。 */
 	ctr_drbg_update(ctx, seed);
 	ctx->reseed_counter = 1;
+	ctx->bytes_since_seed = 0;
+	ctx->last_seed_time = time(NULL);
 	return 1;
 }
 
@@ -109,16 +123,30 @@ int qrng_drbg_instantiated(const qrng_drbg_ctx_t *ctx) {
 }
 
 int qrng_drbg_needs_reseed(const qrng_drbg_ctx_t *ctx) {
-	return ctx == NULL || !ctx->instantiated
-	       || ctx->reseed_counter > ctx->reseed_interval;
+	if (ctx == NULL || !ctx->instantiated) {
+		return 1;
+	}
+	if (ctx->reseed_counter > ctx->reseed_interval) {
+		return 1; /* 阈值 1：请求数（90A 原生语义） */
+	}
+	if (ctx->byte_limit != 0 && ctx->bytes_since_seed >= ctx->byte_limit) {
+		return 1; /* 阈值 2：单种子字节总量（防大请求失衡） */
+	}
+	if (ctx->time_limit != 0
+	    && (uint64_t)(time(NULL) - ctx->last_seed_time) >= ctx->time_limit) {
+		return 1; /* 阈值 3：时间（防安静服务失衡，惰性触发） */
+	}
+	return 0;
 }
 
 int qrng_drbg_generate(qrng_drbg_ctx_t *ctx, uint8_t *out, size_t n) {
 	if (ctx == NULL || out == NULL || n == 0) {
 		return 0;
 	}
-	/* 10.2.1.5.1 步骤 1：reseed required 就拒绝，不许静默生成 */
-	if (!ctx->instantiated || ctx->reseed_counter > ctx->reseed_interval) {
+	/* 10.2.1.5.1 步骤 1：reseed required 就拒绝，不许静默生成。
+	 * 判定与 qrng_drbg_needs_reseed 一致：三个阈值（请求/字节/时间）
+	 * 任一触发都拒绝——直接调用方与核心层走同一套语义 */
+	if (qrng_drbg_needs_reseed(ctx)) {
 		return 0;
 	}
 
@@ -151,8 +179,9 @@ int qrng_drbg_generate(qrng_drbg_ctx_t *ctx, uint8_t *out, size_t n) {
 		 * Update(0^seedlen)——不是可选项。 */
 		ctr_drbg_update(ctx, zeros);
 
-		/* 步骤 7：reseed_counter+1 */
+		/* 步骤 7：reseed_counter+1；字节总量记账（阈值 2） */
 		ctx->reseed_counter++;
+		ctx->bytes_since_seed += (uint64_t)chunk;
 		done += chunk;
 	}
 	return 1;

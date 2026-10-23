@@ -210,6 +210,18 @@ AES-256 自包含（只需加密方向，CTR/DRBG 永不解密），FIPS 197 + 8
   （100 万请求不碰设备）；`--reseed-interval 1` = 严格模式，掉线即拒绝
 - 修复：daemonize 未重定向 stdio（守护进程攥住调用方管道）
 
+## 8.1 v5 可靠性补强实测（监控心跳 + 双阈值 reseed）
+
+- 心跳实测：`--monitor-interval 30`，**无任何客户端请求**时 deauth 设备
+  → 30 秒内心跳独立发现（`monitor: SOURCE FAILURE`）→ exit-on-failure
+  → systemd 重启 → 设备恢复 → 自动 active、门禁重过、恢复供数
+- 修复前同一场景：DRBG 模式下设备掉线**永远不会被发现**（直到百万次
+  请求后 reseed 才碰源）——这就是时间盲区
+- 双阈值 reseed：字节阈值（32B）触发后核心自动拉新种子（记账
+  48+48 可核对）；时间阈值 1s 触发（单测覆盖）
+- 新增测试：`test_dual_threshold_reseed`、`test_core_monitor`（含
+  记账诚实性：心跳字节计入 bytes_read、不进条件化记账）
+
 ## 9. 关键实测数字（pqcvm03，Quantis USB）
 
 | 指标 | 数值 |

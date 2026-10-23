@@ -5,7 +5,8 @@
 
 /* qrng-cli 与 qrng-server 共享的"层参数"解析器（v4 抽取）：
  *   --health on|off / --condition on|off / --drbg on|off
- *   --reseed-interval N / --min-entropy H / --alpha-log2 N / --startup N
+ *   --reseed-interval N / --reseed-bytes N / --reseed-seconds N
+ *   --min-entropy H / --alpha-log2 N / --startup N
  *
  * 用法：应用主循环里对每个 argv 调用本函数。
  * 返回 1 = 是层选项且已消费（*argi 已推进到值后）；

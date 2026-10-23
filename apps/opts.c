@@ -45,6 +45,12 @@ int qrng_opts_try_parse(int argc, char **argv, int *argi,
 	} else if (strcmp(arg, "--reseed-interval") == 0) {
 		cfg->drbg.reseed_interval = strtoull(val, NULL, 0);
 		ok = 1;
+	} else if (strcmp(arg, "--reseed-bytes") == 0) {
+		cfg->drbg.reseed_bytes = strtoull(val, NULL, 0);
+		ok = 1;
+	} else if (strcmp(arg, "--reseed-seconds") == 0) {
+		cfg->drbg.reseed_seconds = strtoull(val, NULL, 0);
+		ok = 1;
 	} else if (strcmp(arg, "--min-entropy") == 0) {
 		cfg->health.min_entropy_bits = strtod(val, NULL);
 		cfg->condition.min_entropy_bits = cfg->health.min_entropy_bits;

@@ -88,6 +88,14 @@ uint64_t qrng_core_condition_bytes_out(const qrng_core_t *core);
 uint64_t qrng_core_drbg_bytes_generated(const qrng_core_t *core);
 uint64_t qrng_core_drbg_reseeds(const qrng_core_t *core);
 
+/* 监控心跳（v5 可靠性）：从熵源拉 n 字节，仅过健康测试后丢弃。
+ * 不进输出、不进条件化，但计入 bytes_read（记账不撒谎）。
+ * 目的：DRBG 模式下源字节只在种子时流动，健康状态机存在时间盲区
+ * （百万次请求只监测约 1KB 源数据）——心跳让源在时间维度持续受检。
+ * 返回 1 = 源仍健康；返回 0 = 源故障（核心进终态，fail-closed，
+ * 原因用 qrng_core_last_error 取）。健康测试未启用时返回 1（无监控对象）。 */
+int qrng_core_monitor(qrng_core_t *core, size_t n);
+
 /* 健康测试上下文（只读）：NULL = 未启用。
  * 用 qrng_health_* 访问器查阈值/进度，供 CLI 打印与测试断言。 */
 const qrng_health_ctx_t *qrng_core_health(const qrng_core_t *core);
